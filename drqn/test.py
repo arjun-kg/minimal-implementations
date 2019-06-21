@@ -2,13 +2,14 @@ import gym
 import pdb
 from scipy.misc import imresize
 from scipy.misc import imshow
-env = gym.make('Pong-v0')
+env = gym.make('PongNoFrameskip-v4')
 
 def preprocess(im):
     # image expects 210 x 160 x 3
     im = 0.2989*im[:, :, 0] + 0.5870*im[:, :, 1] + 0.1140*im[:, :, 2]
     im = imresize(im, (110, 84))
     im = im[18:102, :]
+    imshow(im)
     return im
 
 for ep in range(100):

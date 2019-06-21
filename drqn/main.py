@@ -13,19 +13,19 @@ from tensorboardX import SummaryWriter
 import pdb
 
 env_name = 'PongNoFrameskip-v4'
-n_episodes = 1000
-seq_len = 20
-train_batch_size = 64
+n_episodes = 50000
+seq_len = 10
+train_batch_size = 32
 optim_steps_per_ep = 10
 gamma = 0.99
-target_update_freq = 10
+target_update_freq = 2
 eps_start = 1
-eps_end = 0.05
-temperature = 1e6
-evaluate_freq = 10
+eps_end = 0.1
+temperature = 1e7
+evaluate_freq = 5
 seed = 0
 load_path = None
-save_freq = 20
+save_freq = 100
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ExpReplay:
@@ -146,7 +146,7 @@ def evaluate_episode(env, policy):
     while not done:
         env.render()
         action, hidden = policy.get_action(p_state, hidden, eval=True)
-        next_state, reward, done, _ = env.step(action)
+        next_state, reward, done, _ = env.step(action + 2)
         if next_state is not None:
             p_state = preprocess(next_state)
         steps += 1
@@ -174,11 +174,11 @@ if __name__ == '__main__':
 
     time_start = time.time()
 
-    policy = DRQN(env.action_space.n).to(device)
+    policy = DRQN(2).to(device)
     if load_path is not None:
         policy.load_state_dict(torch.load(load_path))
         print("Policy loaded from '{}'".format(load_path))
-    target_net = DRQN(env.action_space.n).to(device)
+    target_net = DRQN(2).to(device)
     target_net.load_state_dict(policy.state_dict())
     target_net.eval()
     memory = ExpReplay()
@@ -199,7 +199,7 @@ if __name__ == '__main__':
 
         while not done:
             action, hidden = policy.get_action(p_state, hidden)
-            next_state, reward, done, info = env.step(action)
+            next_state, reward, done, info = env.step(action+2)  # pong actions are 2 and 3
 
             if next_state is not None:
                 p_next_state = preprocess(next_state)
