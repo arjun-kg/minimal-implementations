@@ -44,7 +44,7 @@ class ExpReplay:
             self.rewards.append(0)
             self.dones.append(0)
 
-        state_seq, action_seq, reward_seq, done = exp_tuple
+        state_seq, action_seq, reward_seq, done_seq = exp_tuple
         self.states[self.pointer] = state_seq
         self.actions[self.pointer] = action_seq
         self.rewards[self.pointer] = reward_seq
