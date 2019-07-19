@@ -22,7 +22,7 @@ target_update_freq = 2
 eps_start = 1
 eps_end = 0.1
 temperature = 1e7
-evaluate_freq = 5
+evaluate_freq = 50
 seed = 0
 load_path = None
 save_freq = 100
@@ -134,7 +134,7 @@ def optimize_model(policy, target_net, memory, optimizer):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-
+    return loss
 
 def evaluate_episode(env, policy):
     done = False
@@ -143,15 +143,18 @@ def evaluate_episode(env, policy):
     hidden = (torch.zeros(1, 1, 512).to(device),
               torch.zeros(1, 1, 512).to(device))
     steps = 0
+    rew_ep = 0
     while not done:
         env.render()
         action, hidden = policy.get_action(p_state, hidden, eval=True)
         next_state, reward, done, _ = env.step(action + 2)
+        rew_ep += reward
         if next_state is not None:
             p_state = preprocess(next_state)
         steps += 1
 
-    print("Evaluation Reward: {}".format(steps))
+    print("Evaluation Reward: {}".format(rew_ep))
+    return rew_ep
 
 
 def preprocess(im):
@@ -197,10 +200,12 @@ if __name__ == '__main__':
         reward_seq = []
         done_seq = []
 
+        rew_ep = 0
+
         while not done:
             action, hidden = policy.get_action(p_state, hidden)
             next_state, reward, done, info = env.step(action+2)  # pong actions are 2 and 3
-
+            rew_ep += reward
             if next_state is not None:
                 p_next_state = preprocess(next_state)
             else:
@@ -234,9 +239,9 @@ if __name__ == '__main__':
                 memory.add(exp_tuple)
 
         for _ in range(optim_steps_per_ep):
-            optimize_model(policy, target_net, memory, optimizer)
+            loss = optimize_model(policy, target_net, memory, optimizer)
             optim_steps += 1
-
+            writer.add_scalar('train/loss', loss, optim_steps)
         if ep % target_update_freq == 0:
             target_net.load_state_dict(policy.state_dict())
 
@@ -244,10 +249,14 @@ if __name__ == '__main__':
             torch.save(policy.state_dict(), dir_name+'/policy_net_{}'.format(ep))
             print("Saved policy after episode {} in '{}'".format(ep, dir_name+'/policy_net_{}'.format(ep)))
 
-        print("\nEpisode: {}\nTrain Timesteps: {}\nOptimization Steps: {}\nTime Elapsed: {}\nEpsilon: {}\n"
-              .format(ep, policy.t, optim_steps, time.time() - time_start, policy.eps))
+        print("\nEpisode: {}\nTrain Timesteps: {}\nOptimization Steps: {}\nTime Elapsed: {}\nEpsilon: "
+              "{}\nEpisode Reward: {}\n"
+              .format(ep, policy.t, optim_steps, time.time() - time_start, policy.eps, rew_ep))
+        writer.add_scalar('train/epsilon', policy.eps, ep)
+        writer.add_scalar('train/rew', rew_ep, ep)
 
         if ep % evaluate_freq == 0:
-            evaluate_episode(env, policy)
+            rew_eval = evaluate_episode(env, policy)
+            writer.add_scalar('eval/rew', rew_eval, ep)
 
     print("Training completed in {} seconds".format(time.time() - time_start))
