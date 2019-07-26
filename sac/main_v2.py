@@ -12,8 +12,7 @@ import numpy as np
 
 import pdb
 
-from sac.networks import Actor, QNet, VNet
-
+from rl\-implementations.sac.networks import Actor, QNet
 
 env_name = 'Pendulum-v0'
 n_episodes = 10000
@@ -25,8 +24,8 @@ target_smoothing_coeff = 0.005
 lr = 3e-4
 logstd_min = -20
 logstd_max = 2
-reward_scaling = 1
-entropy_coeff = -1e-10
+reward_scaling = 5
+entropy_coeff = 1
 
 evaluate_freq = 25
 seed = 0
@@ -70,54 +69,8 @@ class ExpReplay:
         return len(self.states)
 
 
-class Actor(nn.Module):
-    def __init__(self, input_size, output_size, action_scale):
-        super(Actor, self).__init__()
 
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc_mean = nn.Linear(hidden_size, output_size)
-        self.fc_logstd = nn.Linear(hidden_size, output_size)
-
-        self.output_size = output_size
-        self.action_scale = action_scale
-
-    def forward(self, x):
-
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x_m = self.fc_mean(x)
-        x_ls = torch.clamp(self.fc_logstd(x), min=logstd_min, max=logstd_max)
-
-        return x_m, x_ls
-
-    def get_action(self, state):
-
-        state_th = torch.tensor(state).float().to(device)
-        action_mean_th, action_logstd_th = self.forward(state_th)
-        action_th_sampled = torch.tanh(Normal(action_mean_th, torch.exp(action_logstd_th)).sample())*\
-                            torch.tensor(self.action_scale).to(device)
-        action = action_th_sampled.cpu().detach().numpy()
-        return action
-
-
-class QNet(nn.Module):
-    def __init__(self, state_size, action_size):
-        super(QNet, self).__init__()
-
-        self.fc1 = nn.Linear(state_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size + action_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, 1)
-
-    def forward(self, s, a):
-        x = F.relu(self.fc1(s))
-        x = F.relu(self.fc2(torch.cat((x, a), dim=-1)))
-        x = self.fc3(x)
-        return x
-
-
-
-def optimize_model(policy, q1_net, q2_net, v_net, v_target_net, memory, actor_optimizer, q_net_optimizer, v_net_optimizer):
+def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory, actor_optimizer, q_net_optimizer):
     if len(memory) < train_batch_size:
         return 0, 0, 0  # dummy losses for consistency in presenting results
 
@@ -130,8 +83,13 @@ def optimize_model(policy, q1_net, q2_net, v_net, v_target_net, memory, actor_op
 
     Q1_vals = q1_net(states_th, actions_th)
     Q2_vals = q2_net(states_th, actions_th)
-    V_vals = v_net(states_th)
-    V_next_state_vals = v_target_net(next_states_th)
+    next_action_means, next_action_stds = policy(next_states_th)
+    next_actions = Normal(next_action_means, next_action_stds).sample()
+    Q1_next_state_vals = q1_target_net(next_states_th, next_actions)
+    Q2_next_state_vals = q2_target_net(next_states_th, next_actions)
+    Q_next_state_minvals = torch.min(Q1_next_state_vals, Q2_next_state_vals)
+    Q_target = rewards_th + gamma*Q_next_state_minvals*(1 - dones_th)
+
     pi_action_means, pi_action_logstd = policy(states_th)
     pi_action_stds = torch.exp(pi_action_logstd)
 
@@ -142,23 +100,19 @@ def optimize_model(policy, q1_net, q2_net, v_net, v_target_net, memory, actor_op
     newly_sampled_Q2_vals = q2_net(states_th, newly_sampled_actions)
     newly_sampled_Q_minvals = torch.min(newly_sampled_Q1_vals, newly_sampled_Q2_vals)
 
-    J_v = torch.mean((V_vals - (newly_sampled_Q_minvals.detach() - entropy_coeff*newly_sampled_action_log_probs.detach()))**2)
-    v_net_optimizer.zero_grad()
-    J_v.backward()
-    v_net_optimizer.step()
-
-    J_q1 = torch.mean((Q1_vals - (rewards_th + gamma*V_next_state_vals*(1-dones_th)))**2)
-    J_q2 = torch.mean((Q2_vals - (rewards_th + gamma * V_next_state_vals * (1 - dones_th))) ** 2)
+    J_q1 = torch.mean((Q1_vals - Q_target)**2)
+    J_q2 = torch.mean((Q2_vals - Q_target)**2)
     J_q = J_q1 + J_q2
     q_net_optimizer.zero_grad()
     J_q.backward()
     q_net_optimizer.step()
 
     J_pi = torch.mean(entropy_coeff*newly_sampled_action_log_probs - newly_sampled_Q_minvals)
+    pdb.set_trace()
     actor_optimizer.zero_grad()
     J_pi.backward()
     actor_optimizer.step()
-    return J_v, J_q, J_pi
+    return J_q, J_pi
 
 
 def evaluate_episode(env, policy):
@@ -195,14 +149,15 @@ if __name__ == '__main__':
     policy = Actor(env.observation_space.shape[0], env.action_space.shape[0],env.action_space.high).to(device)
     q1_net = QNet(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
     q2_net = QNet(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
-    v_net = VNet(env.observation_space.shape[0]).to(device)
-    v_target_net = VNet(env.observation_space.shape[0]).to(device)
-    v_target_net.eval()
-    v_target_net.load_state_dict(v_net.state_dict())
+    q1_target_net = QNet(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
+    q2_target_net = QNet(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
+    q1_target_net.eval()
+    q1_target_net.load_state_dict(q1_net.state_dict())
+    q2_target_net.eval()
+    q2_target_net.load_state_dict(q2_net.state_dict())
 
     actor_optimizer = optim.Adam(policy.parameters(), lr=lr)
     q_net_optimizer = optim.Adam([*q1_net.parameters(), *q2_net.parameters()], lr=lr)
-    v_net_optimizer = optim.Adam(v_net.parameters(), lr=lr)
     memory = ExpReplay()
     steps = 0
 
@@ -220,17 +175,18 @@ if __name__ == '__main__':
             exp_tuple = (state, action, reward_scaling*reward, next_state, done)
             memory.add(exp_tuple)
 
-            loss = optimize_model(policy, q1_net, q2_net, v_net, v_target_net, memory,
-                                  actor_optimizer, q_net_optimizer, v_net_optimizer)
+            loss = optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory,
+                                  actor_optimizer, q_net_optimizer)
 
-            for t_par, par in zip(v_target_net.parameters(), v_net.parameters()):
+            for t_par, par in zip(q1_target_net.parameters(), q1_net.parameters()):
+                t_par.data = par.data*target_smoothing_coeff + t_par.data*(1-target_smoothing_coeff)
+            for t_par, par in zip(q2_target_net.parameters(), q2_net.parameters()):
                 t_par.data = par.data*target_smoothing_coeff + t_par.data*(1-target_smoothing_coeff)
 
             state = next_state
 
-        writer.add_scalar('train/V-loss', loss[0], ep)
-        writer.add_scalar('train/Q-loss', loss[1], ep)
-        writer.add_scalar('train/Pi-loss', loss[2], ep)
+        writer.add_scalar('train/Q-loss', loss[0], ep)
+        writer.add_scalar('train/Pi-loss', loss[1], ep)
         writer.add_scalar('train/Total loss', sum(loss), ep)
         writer.add_scalar('train/steps', steps, ep)
 
