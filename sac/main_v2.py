@@ -12,18 +12,15 @@ import numpy as np
 
 import pdb
 
-from rl\-implementations.sac.networks import Actor, QNet
+from rl_implementations.sac.networks import Actor, QNet
 
 env_name = 'Pendulum-v0'
 n_episodes = 10000
-hidden_size = 256
 replay_buffer_size = 1e6
 train_batch_size = 256
 gamma = 0.99
 target_smoothing_coeff = 0.005
 lr = 3e-4
-logstd_min = -20
-logstd_max = 2
 reward_scaling = 5
 entropy_coeff = 1
 
@@ -70,7 +67,8 @@ class ExpReplay:
 
 
 
-def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory, actor_optimizer, q_net_optimizer):
+def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net,
+                   memory, actor_optimizer, q1_net_optimizer, q2_net_optimizer):
     if len(memory) < train_batch_size:
         return 0, 0, 0  # dummy losses for consistency in presenting results
 
@@ -85,10 +83,12 @@ def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory,
     Q2_vals = q2_net(states_th, actions_th)
     next_action_means, next_action_stds = policy(next_states_th)
     next_actions = Normal(next_action_means, next_action_stds).sample()
-    Q1_next_state_vals = q1_target_net(next_states_th, next_actions)
-    Q2_next_state_vals = q2_target_net(next_states_th, next_actions)
-    Q_next_state_minvals = torch.min(Q1_next_state_vals, Q2_next_state_vals)
-    Q_target = rewards_th + gamma*Q_next_state_minvals*(1 - dones_th)
+
+    with torch.no_grad():
+        Q1_next_state_vals = q1_target_net(next_states_th, next_actions)
+        Q2_next_state_vals = q2_target_net(next_states_th, next_actions)
+        Q_next_state_minvals = torch.min(Q1_next_state_vals, Q2_next_state_vals)
+        Q_target = rewards_th + gamma*Q_next_state_minvals*(1 - dones_th)
 
     pi_action_means, pi_action_logstd = policy(states_th)
     pi_action_stds = torch.exp(pi_action_logstd)
@@ -97,22 +97,21 @@ def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory,
     newly_sampled_actions = pi_action_means + z*pi_action_stds
     newly_sampled_action_log_probs = Normal(pi_action_means, pi_action_stds).log_prob(newly_sampled_actions)
     newly_sampled_Q1_vals = q1_net(states_th, newly_sampled_actions)
-    newly_sampled_Q2_vals = q2_net(states_th, newly_sampled_actions)
-    newly_sampled_Q_minvals = torch.min(newly_sampled_Q1_vals, newly_sampled_Q2_vals)
 
     J_q1 = torch.mean((Q1_vals - Q_target)**2)
     J_q2 = torch.mean((Q2_vals - Q_target)**2)
-    J_q = J_q1 + J_q2
-    q_net_optimizer.zero_grad()
-    J_q.backward()
-    q_net_optimizer.step()
+    q1_net_optimizer.zero_grad()
+    J_q1.backward()
+    q1_net_optimizer.step()
+    q2_net_optimizer.zero_grad()
+    J_q2.backward()
+    q2_net_optimizer.step()
 
-    J_pi = torch.mean(entropy_coeff*newly_sampled_action_log_probs - newly_sampled_Q_minvals)
-    pdb.set_trace()
+    J_pi = torch.mean(entropy_coeff*newly_sampled_action_log_probs - newly_sampled_Q1_vals)
     actor_optimizer.zero_grad()
     J_pi.backward()
     actor_optimizer.step()
-    return J_q, J_pi
+    return J_q1, J_pi
 
 
 def evaluate_episode(env, policy):
@@ -133,6 +132,7 @@ def evaluate_episode(env, policy):
 
     print("Evaluation Reward: {}, Average Std: {}".format(rew_ep, sum_std/steps))
     return rew_ep
+
 
 if __name__ == '__main__':
 
@@ -157,7 +157,8 @@ if __name__ == '__main__':
     q2_target_net.load_state_dict(q2_net.state_dict())
 
     actor_optimizer = optim.Adam(policy.parameters(), lr=lr)
-    q_net_optimizer = optim.Adam([*q1_net.parameters(), *q2_net.parameters()], lr=lr)
+    q1_net_optimizer = optim.Adam(q1_net.parameters(), lr=lr)
+    q2_net_optimizer = optim.Adam(q2_net.parameters(), lr=lr)
     memory = ExpReplay()
     steps = 0
 
@@ -176,7 +177,7 @@ if __name__ == '__main__':
             memory.add(exp_tuple)
 
             loss = optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory,
-                                  actor_optimizer, q_net_optimizer)
+                                  actor_optimizer, q1_net_optimizer, q2_net_optimizer)
 
             for t_par, par in zip(q1_target_net.parameters(), q1_net.parameters()):
                 t_par.data = par.data*target_smoothing_coeff + t_par.data*(1-target_smoothing_coeff)

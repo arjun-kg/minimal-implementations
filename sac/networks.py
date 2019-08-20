@@ -1,4 +1,12 @@
 import torch.nn as nn
+import torch
+import torch.nn.functional as F
+from torch.distributions import Normal
+
+hidden_size = 256
+logstd_min = -20
+logstd_max = 2
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Actor(nn.Module):
     def __init__(self, input_size, output_size, action_scale):
