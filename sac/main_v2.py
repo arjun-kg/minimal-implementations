@@ -21,11 +21,12 @@ train_batch_size = 256
 gamma = 0.99
 target_smoothing_coeff = 0.005
 lr = 3e-4
-reward_scaling = 5
+reward_scaling = 1
 entropy_coeff = 1
+n_train_steps_per_ep = 500
 
 evaluate_freq = 25
-seed = 0
+seed = 458
 load_path = None
 save_freq = 100
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,19 +85,25 @@ def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net,
     next_action_means, next_action_stds = policy(next_states_th)
     next_actions = Normal(next_action_means, next_action_stds).sample()
 
-    with torch.no_grad():
-        Q1_next_state_vals = q1_target_net(next_states_th, next_actions)
-        Q2_next_state_vals = q2_target_net(next_states_th, next_actions)
-        Q_next_state_minvals = torch.min(Q1_next_state_vals, Q2_next_state_vals)
-        Q_target = rewards_th + gamma*Q_next_state_minvals*(1 - dones_th)
-
     pi_action_means, pi_action_logstd = policy(states_th)
     pi_action_stds = torch.exp(pi_action_logstd)
 
     z = Normal(torch.zeros_like(pi_action_means), torch.ones_like(pi_action_stds)).sample()
     newly_sampled_actions = pi_action_means + z*pi_action_stds
     newly_sampled_action_log_probs = Normal(pi_action_means, pi_action_stds).log_prob(newly_sampled_actions)
+
+    after_tanh_actions = torch.tanh(newly_sampled_actions)  # skipping action scaling
+    after_tanh_log_probs = newly_sampled_action_log_probs - torch.log(1-after_tanh_actions**2 + 1e-6)
+
     newly_sampled_Q1_vals = q1_net(states_th, newly_sampled_actions)
+    newly_sampled_Q2_vals = q2_net(states_th, newly_sampled_actions)
+    newly_sampled_Q_minvals = torch.min(newly_sampled_Q1_vals, newly_sampled_Q2_vals)
+
+    with torch.no_grad():
+        Q1_next_state_vals = q1_target_net(next_states_th, next_actions)
+        Q2_next_state_vals = q2_target_net(next_states_th, next_actions)
+        Q_next_state_minvals = torch.min(Q1_next_state_vals, Q2_next_state_vals) - newly_sampled_action_log_probs # Why last term?
+        Q_target = rewards_th + gamma*Q_next_state_minvals*(1 - dones_th)
 
     J_q1 = torch.mean((Q1_vals - Q_target)**2)
     J_q2 = torch.mean((Q2_vals - Q_target)**2)
@@ -106,8 +113,7 @@ def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net,
     q2_net_optimizer.zero_grad()
     J_q2.backward()
     q2_net_optimizer.step()
-
-    J_pi = torch.mean(entropy_coeff*newly_sampled_action_log_probs - newly_sampled_Q1_vals)
+    J_pi = torch.mean(entropy_coeff*torch.sum(after_tanh_log_probs, dim=-1) - newly_sampled_Q_minvals)
     actor_optimizer.zero_grad()
     J_pi.backward()
     actor_optimizer.step()
@@ -176,6 +182,9 @@ if __name__ == '__main__':
             exp_tuple = (state, action, reward_scaling*reward, next_state, done)
             memory.add(exp_tuple)
 
+            state = next_state
+
+        for _ in range(n_train_steps_per_ep):
             loss = optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory,
                                   actor_optimizer, q1_net_optimizer, q2_net_optimizer)
 
@@ -183,8 +192,6 @@ if __name__ == '__main__':
                 t_par.data = par.data*target_smoothing_coeff + t_par.data*(1-target_smoothing_coeff)
             for t_par, par in zip(q2_target_net.parameters(), q2_net.parameters()):
                 t_par.data = par.data*target_smoothing_coeff + t_par.data*(1-target_smoothing_coeff)
-
-            state = next_state
 
         writer.add_scalar('train/Q-loss', loss[0], ep)
         writer.add_scalar('train/Pi-loss', loss[1], ep)

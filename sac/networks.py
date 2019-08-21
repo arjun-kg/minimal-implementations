@@ -6,6 +6,7 @@ from torch.distributions import Normal
 hidden_size = 256
 logstd_min = -20
 logstd_max = 2
+init_w = 1e-3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Actor(nn.Module):
@@ -16,7 +17,10 @@ class Actor(nn.Module):
         self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.fc_mean = nn.Linear(hidden_size, output_size)
         self.fc_logstd = nn.Linear(hidden_size, output_size)
-
+        self.fc_mean.weight.data.uniform_(-init_w, init_w)
+        self.fc_mean.bias.data.uniform_(-init_w, init_w)
+        self.fc_logstd.weight.data.uniform_(-init_w, init_w)
+        self.fc_logstd.bias.data.uniform_(-init_w, init_w)
         self.output_size = output_size
         self.action_scale = action_scale
 
@@ -43,13 +47,16 @@ class QNet(nn.Module):
     def __init__(self, state_size, action_size):
         super(QNet, self).__init__()
 
-        self.fc1 = nn.Linear(state_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size + action_size, hidden_size)
+        self.fc1 = nn.Linear(state_size + action_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
         self.fc3 = nn.Linear(hidden_size, 1)
+        self.fc3.weight.data.uniform_(-init_w, init_w)
+        self.fc3.bias.data.uniform_(-init_w, init_w)
 
     def forward(self, s, a):
-        x = F.relu(self.fc1(s))
-        x = F.relu(self.fc2(torch.cat((x, a), dim=-1)))
+        x = torch.cat((s,a), dim=-1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
 
