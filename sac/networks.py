@@ -10,7 +10,7 @@ init_w = 1e-3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Actor(nn.Module):
-    def __init__(self, input_size, output_size, action_scale):
+    def __init__(self, input_size, output_size):
         super(Actor, self).__init__()
 
         self.fc1 = nn.Linear(input_size, hidden_size)
@@ -22,7 +22,6 @@ class Actor(nn.Module):
         self.fc_logstd.weight.data.uniform_(-init_w, init_w)
         self.fc_logstd.bias.data.uniform_(-init_w, init_w)
         self.output_size = output_size
-        self.action_scale = action_scale
 
     def forward(self, x):
 
@@ -37,8 +36,7 @@ class Actor(nn.Module):
 
         state_th = torch.tensor(state).float().to(device)
         action_mean_th, action_logstd_th = self.forward(state_th)
-        action_th_sampled = torch.tanh(Normal(action_mean_th, torch.exp(action_logstd_th)).sample())*\
-                            torch.tensor(self.action_scale).to(device)
+        action_th_sampled = torch.tanh(Normal(action_mean_th, torch.exp(action_logstd_th)).sample())
         action = action_th_sampled.cpu().detach().numpy()
         return action
 

@@ -15,19 +15,20 @@ import pdb
 
 from rl_implementations.sac.networks import Actor, QNet
 
-env_name = 'Pendulum-v0'
-n_episodes = 10000
+env_name = 'Humanoid-v2'
+n_epochs = 1000
+n_rollout_steps_per_epoch = 1000
+n_train_steps_per_epoch = 1000
 replay_buffer_size = 1e6
 train_batch_size = 256
 gamma = 0.99
 target_smoothing_coeff = 0.005
 lr = 1e-3
-reward_scaling = 5
+reward_scaling = 20
 entropy_coeff = 1
-n_train_steps_per_ep = 200
 
-evaluate_freq = 10
-seed = 1
+evaluate_freq = 1
+seed = 3
 load_path = None
 save_freq = 100
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,8 +82,8 @@ def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net,
 
     Q1_vals = q1_net(states_th, actions_th)
     Q2_vals = q2_net(states_th, actions_th)
-    next_action_means, next_action_stds = policy(next_states_th)
-    next_actions = Normal(next_action_means, next_action_stds).sample()
+    next_action_means, next_action_logstds = policy(next_states_th)
+    next_actions = torch.tanh(Normal(next_action_means, torch.exp(next_action_logstds)).sample())
 
     pi_action_means, pi_action_logstd = policy(states_th)
     pi_action_stds = torch.exp(pi_action_logstd)
@@ -94,8 +95,8 @@ def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net,
     after_tanh_actions = torch.tanh(newly_sampled_actions)  # skipping action scaling
     after_tanh_log_probs = newly_sampled_action_log_probs - torch.log(1-after_tanh_actions**2 + 1e-6)
 
-    newly_sampled_Q1_vals = q1_net(states_th, newly_sampled_actions)
-    newly_sampled_Q2_vals = q2_net(states_th, newly_sampled_actions)
+    newly_sampled_Q1_vals = q1_net(states_th, after_tanh_actions)
+    newly_sampled_Q2_vals = q2_net(states_th, after_tanh_actions)
     newly_sampled_Q_minvals = torch.min(newly_sampled_Q1_vals, newly_sampled_Q2_vals)
 
     with torch.no_grad():
@@ -187,30 +188,32 @@ if __name__ == '__main__':
     q1_net_optimizer = optim.Adam(q1_net.parameters(), lr=lr)
     q2_net_optimizer = optim.Adam(q2_net.parameters(), lr=lr)
     memory = ExpReplay()
-    steps = 0
-    train_steps = 0
+    total_train_steps = 0
     eval_ep = 0
 
-    for ep in tqdm(range(n_episodes)):
-        state = env.reset()
-        done = False
-        rew_ep = 0
+    for ep in tqdm(range(n_epochs)):
+        rollout_steps = 0
 
-        while not done:
-            steps += 1
-            action = policy.get_action(state)
-            next_state, reward, done, info = env.step(action)
-            rew_ep += reward
+        while rollout_steps < n_rollout_steps_per_epoch:
+            state = env.reset()
+            done = False
+            rew_ep = 0
 
-            exp_tuple = (state, action, reward_scaling*reward, next_state, done)
-            memory.add(exp_tuple)
+            while not done:
+                rollout_steps += 1
+                action = policy.get_action(state)
+                next_state, reward, done, info = env.step(action)
+                rew_ep += reward
 
-            state = next_state
+                exp_tuple = (state, action, reward_scaling*reward, next_state, done)
+                memory.add(exp_tuple)
 
-        for _ in range(n_train_steps_per_ep):
+                state = next_state
+
+        for _ in range(n_train_steps_per_epoch):
             optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory,
-                                  actor_optimizer, q1_net_optimizer, q2_net_optimizer, writer, train_steps)
-            train_steps += 1
+                           actor_optimizer, q1_net_optimizer, q2_net_optimizer, writer, total_train_steps)
+            total_train_steps += 1
 
             for t_par, par in zip(q1_target_net.parameters(), q1_net.parameters()):
                 t_par.data = par.data*target_smoothing_coeff + t_par.data*(1-target_smoothing_coeff)
