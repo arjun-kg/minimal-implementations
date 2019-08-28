@@ -15,7 +15,7 @@ import pdb
 
 from rl_implementations.sac.networks import Actor, QNet
 
-env_name = 'Humanoid-v2'
+env_name = 'Pendulum-v0'
 n_epochs = 1000
 n_rollout_steps_per_epoch = 1000
 n_train_steps_per_epoch = 1000
@@ -24,14 +24,19 @@ train_batch_size = 256
 gamma = 0.99
 target_smoothing_coeff = 0.005
 lr = 1e-3
-reward_scaling = 20
-entropy_coeff = 1
+
+reward_scaling = 1
+automatic_entropy_tuning = True
+
+if not automatic_entropy_tuning:
+    alpha = 1
 
 evaluate_freq = 1
-seed = 3
+seed = 8
 load_path = None
 save_freq = 100
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class ExpReplay:
     def __init__(self):
@@ -61,7 +66,7 @@ class ExpReplay:
 
     def sample(self, batch_size):
         st_b, ac_b, rew_b, nst_b, dn_b = \
-            zip(*random.sample(list(zip(self.states,self.actions,self.rewards, self.next_states, self.dones)),
+            zip(*random.sample(list(zip(self.states, self.actions, self.rewards, self.next_states, self.dones)),
                                batch_size))
         return st_b, ac_b, rew_b, nst_b, dn_b
 
@@ -69,8 +74,9 @@ class ExpReplay:
         return len(self.states)
 
 
-def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net,
-                   memory, actor_optimizer, q1_net_optimizer, q2_net_optimizer, writer, train_steps):
+def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, log_alpha,
+                   memory, actor_optimizer, q1_net_optimizer, q2_net_optimizer, alpha_optimizer,
+                   writer, train_steps, target_entropy):
     if len(memory) < train_batch_size:
         return 0, 0, 0  # dummy losses for consistency in presenting results
     st_b, ac_b, rew_b, nst_b, dn_b = memory.sample(train_batch_size)
@@ -89,42 +95,58 @@ def optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net,
     pi_action_stds = torch.exp(pi_action_logstd)
 
     z = Normal(torch.zeros_like(pi_action_means), torch.ones_like(pi_action_stds)).sample()
-    newly_sampled_actions = pi_action_means + z*pi_action_stds
+    newly_sampled_actions = pi_action_means + z * pi_action_stds
     newly_sampled_action_log_probs = Normal(pi_action_means, pi_action_stds).log_prob(newly_sampled_actions)
 
     after_tanh_actions = torch.tanh(newly_sampled_actions)  # skipping action scaling
-    after_tanh_log_probs = newly_sampled_action_log_probs - torch.log(1-after_tanh_actions**2 + 1e-6)
+    after_tanh_log_probs = newly_sampled_action_log_probs - torch.log(1 - after_tanh_actions ** 2 + 1e-6)
 
     newly_sampled_Q1_vals = q1_net(states_th, after_tanh_actions)
     newly_sampled_Q2_vals = q2_net(states_th, after_tanh_actions)
     newly_sampled_Q_minvals = torch.min(newly_sampled_Q1_vals, newly_sampled_Q2_vals)
 
+    if automatic_entropy_tuning:
+        J_alpha = - (log_alpha * (after_tanh_log_probs + target_entropy).detach()).mean()
+
+        alpha_optimizer.zero_grad()
+        J_alpha.backward()
+        alpha_optimizer.step()
+
+        alpha = torch.exp(log_alpha)
+    else:
+        J_alpha = 0
+        alpha = 1
+
+    J_pi = torch.mean(alpha * torch.sum(after_tanh_log_probs, dim=-1, keepdim=True) - newly_sampled_Q_minvals)
+    actor_optimizer.zero_grad()
+    J_pi.backward()
+    actor_optimizer.step()
+
     with torch.no_grad():
         Q1_next_state_vals = q1_target_net(next_states_th, next_actions)
         Q2_next_state_vals = q2_target_net(next_states_th, next_actions)
-        Q_next_state_minvals = torch.min(Q1_next_state_vals, Q2_next_state_vals) - torch.sum(after_tanh_log_probs, dim=-1, keepdim=True) # Why last term?
-        Q_target = rewards_th + gamma*Q_next_state_minvals*(1 - dones_th)
-    J_q1 = torch.mean((Q1_vals - Q_target)**2)
-    J_q2 = torch.mean((Q2_vals - Q_target)**2)
+        Q_next_state_minvals = torch.min(Q1_next_state_vals, Q2_next_state_vals) \
+                               - alpha * torch.sum(after_tanh_log_probs, dim=-1, keepdim=True)
+        Q_target = rewards_th + gamma * Q_next_state_minvals * (1 - dones_th)
+
+    J_q1 = torch.mean((Q1_vals - Q_target) ** 2)
+    J_q2 = torch.mean((Q2_vals - Q_target) ** 2)
     q1_net_optimizer.zero_grad()
     J_q1.backward()
     q1_net_optimizer.step()
     q2_net_optimizer.zero_grad()
     J_q2.backward()
     q2_net_optimizer.step()
-    J_pi = torch.mean(entropy_coeff*torch.sum(after_tanh_log_probs, dim=-1, keepdim=True) - newly_sampled_Q_minvals)
-    actor_optimizer.zero_grad()
-    J_pi.backward()
-    actor_optimizer.step()
 
     # Statistics
     writer.add_scalar('train/Q1-loss', J_q1, train_steps)
     writer.add_scalar('train/Q2-loss', J_q2, train_steps)
     writer.add_scalar('train/Pi-loss', J_pi, train_steps)
+    writer.add_scalar('train/Alpha-loss', J_alpha, train_steps)
     writer.add_scalar('train/Total loss', torch.sum(J_q1 + J_q2 + J_pi), train_steps)
     stats = {'Q1-Vals': Q1_vals, 'Q2-Vals': Q2_vals, 'log-probs': after_tanh_log_probs,
              'action_means_new': pi_action_means, 'action_std_new': pi_action_stds,
-             'action_sampled_new':after_tanh_actions}
+             'action_sampled_new': after_tanh_actions}
 
     report_statistics(stats, train_steps, writer)
 
@@ -141,7 +163,7 @@ def evaluate_episode(env, policy, writer, eval_ep):
         action_mean_th, action_logstd_th = policy.forward(torch.tensor(state).float().to(device))
         action_mean_list.append(action_mean_th)
         action_std_list.append(torch.exp(action_logstd_th))
-        action = torch.tanh(action_mean_th).cpu().detach().numpy()*env.action_space.high
+        action = torch.tanh(action_mean_th).cpu().detach().numpy()
         next_state, reward, done, _ = env.step(action)
         rew_ep += reward
         state = next_state
@@ -187,13 +209,23 @@ if __name__ == '__main__':
     actor_optimizer = optim.Adam(policy.parameters(), lr=lr)
     q1_net_optimizer = optim.Adam(q1_net.parameters(), lr=lr)
     q2_net_optimizer = optim.Adam(q2_net.parameters(), lr=lr)
+
+    if automatic_entropy_tuning:
+        log_alpha = torch.zeros(1, device=device, requires_grad=True)
+        alpha_optimizer = optim.Adam([log_alpha], lr=lr)
+        target_entropy = -np.prod(env.action_space.shape).item()
+    else:
+        log_alpha = None
+        alpha_optimizer = None
+        target_entropy = None
+
     memory = ExpReplay()
     total_train_steps = 0
     eval_ep = 0
 
     for ep in tqdm(range(n_epochs)):
         rollout_steps = 0
-
+        print(log_alpha)
         while rollout_steps < n_rollout_steps_per_epoch:
             state = env.reset()
             done = False
@@ -205,20 +237,21 @@ if __name__ == '__main__':
                 next_state, reward, done, info = env.step(action)
                 rew_ep += reward
 
-                exp_tuple = (state, action, reward_scaling*reward, next_state, done)
+                exp_tuple = (state, action, reward_scaling * reward, next_state, done)
                 memory.add(exp_tuple)
 
                 state = next_state
 
         for _ in range(n_train_steps_per_epoch):
-            optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, memory,
-                           actor_optimizer, q1_net_optimizer, q2_net_optimizer, writer, total_train_steps)
+            optimize_model(policy, q1_net, q2_net, q1_target_net, q2_target_net, log_alpha, memory,
+                           actor_optimizer, q1_net_optimizer, q2_net_optimizer, alpha_optimizer, writer,
+                           total_train_steps, target_entropy)
             total_train_steps += 1
 
             for t_par, par in zip(q1_target_net.parameters(), q1_net.parameters()):
-                t_par.data = par.data*target_smoothing_coeff + t_par.data*(1-target_smoothing_coeff)
+                t_par.data = par.data * target_smoothing_coeff + t_par.data * (1 - target_smoothing_coeff)
             for t_par, par in zip(q2_target_net.parameters(), q2_net.parameters()):
-                t_par.data = par.data*target_smoothing_coeff + t_par.data*(1-target_smoothing_coeff)
+                t_par.data = par.data * target_smoothing_coeff + t_par.data * (1 - target_smoothing_coeff)
 
         if ep % evaluate_freq == 0:
             eval_ep = evaluate_episode(env, policy, writer, eval_ep)
