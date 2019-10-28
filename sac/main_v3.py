@@ -22,11 +22,7 @@ n_train_steps_per_epoch = 1000
 replay_buffer_size = 1e6
 train_batch_size = 256
 gamma = 0.99
-target_smoothing_coeff = 0.005
-lr = 1e-3
-
-reward_scaling = 1
-automatic_entropy_tuning = True
+target_smoothinm
 
 if not automatic_entropy_tuning:
     alpha = 1
