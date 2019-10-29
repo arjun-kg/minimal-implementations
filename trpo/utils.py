@@ -33,9 +33,13 @@ def evaluate(agent, env):
     done = False
     while not done:
         action = agent.get_action(state, eval=True)
-        new_obs, rew, done, _ = env.step(np.tanh(action))
+        new_obs, rew, done, _ = env.step(np.clip(action, -1, 1))
         ep_rew += rew
         state = new_obs
         # env.render()
-        # print(np.tanh(action))
     return ep_rew
+
+def save_model(agent, filename):
+    torch.save({'policy': agent.policy_net.state_dict(),
+                'value_net': agent.value_net.state_dict(),
+                'value_net_optimizer': agent.value_net_optimizer.state_dict()}, filename)

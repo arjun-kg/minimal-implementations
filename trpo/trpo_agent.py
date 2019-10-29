@@ -8,18 +8,18 @@ import pdb
 
 logstd_min = -20
 logstd_max = 2
-gamma = 1
+gamma = 0.99
 lr = 1e-3
 max_kl = 1e-2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class TRPOAgent:
     def __init__(self, n_obs, n_act):
-        self.policy_net = MLP((n_obs,), (n_act, n_act), 3, 256, (lambda x: x, lambda x: torch.clamp(x, min=logstd_min, max=logstd_max))).to(device)
-        self.value_net = MLP((n_obs,), (1,), 3, 256, (lambda x: x,)).to(device)
+        self.policy_net = MLP((n_obs,), (n_act, n_act), 2, 64, (lambda x: x, lambda x: torch.clamp(x, min=logstd_min, max=logstd_max))).to(device)
+        self.value_net = MLP((n_obs,), (1,), 2, 64, (lambda x: x,)).to(device)
 
-        # self.policy_net_optimizer =
         self.value_net_optimizer = optim.Adam(self.value_net.parameters(), lr)
+        self.train_steps = 0
 
     def get_action(self, state, eval=False):
         state_th = torch.tensor(state).to(device).float()
@@ -28,8 +28,7 @@ class TRPOAgent:
         if eval:
             return action_mean_th.cpu().detach().numpy()
         else:
-            z = torch.normal(torch.zeros(action_mean_th.size()), torch.ones(action_mean_th.size())).to(device)
-            action_th = action_mean_th + action_std_th*z
+            action_th = torch.normal(action_mean_th, action_std_th)
             return action_th.detach().cpu().numpy()
 
     def get_log_probs(self, states, actions):
@@ -39,7 +38,8 @@ class TRPOAgent:
         return log_probs
 
 
-    def optimize_model(self, trajectories):
+    def optimize_model(self, trajectories, writer):
+        self.train_steps += 1
         states, states2, actions, rewards, dones = trajectories
 
         states_th = torch.tensor(states).to(device).float()
@@ -62,6 +62,7 @@ class TRPOAgent:
             prev_ret = rewards[i] + gamma*prev_ret*(1-dones[i]) + gamma*v_next*dones[i]
             returns.append(prev_ret)
             adv = rewards[i] + gamma*v_next - values_th[st_p-1]
+
             advantages.append(adv)
 
             if dones[i] and i != len(rewards) - 1:
@@ -70,28 +71,32 @@ class TRPOAgent:
                 st_p -= 1
         returns.reverse()
         advantages.reverse()
-        advantages_th = torch.tensor(advantages).to(device)
+        advantages_th = torch.cat(advantages).to(device)
+        # advantages_th = (advantages_th - advantages_th.mean())/(advantages_th.std() + 1e-4)
         returns_th = torch.tensor(returns).to(device)
 
         loss = -torch.mean(torch.exp(log_probs_th - log_probs_th.detach())*advantages_th)
         g = torch.autograd.grad(loss, self.policy_net.parameters(), retain_graph=True)
         loss_grad = torch.cat([grad.view(-1) for grad in g]).detach()
-        stepdir = self.conjugate_gradient(states2_th, -loss_grad, 10)
+        s = self.conjugate_gradient(states2_th, -loss_grad, 10)
 
-        shs = 0.5 * (stepdir.dot(self.Fvp_direct(states2_th, stepdir)))
+        shs = 0.5 * (s.dot(self.Fvp_direct(states2_th, s)))
         lm = math.sqrt(max_kl / shs)
-        # pdb.set_trace()
-        fullstep = stepdir * lm
+        fullstep = s * lm
         expected_improve = -loss_grad.dot(fullstep)
 
         prev_params = get_flat_params_from(self.policy_net)
         success, new_params = self.line_search(advantages_th, states2_th, actions_th, prev_params, fullstep, expected_improve)
         set_flat_params_to(self.policy_net, new_params)
 
-        v_net_loss = torch.mean((returns_th - values_th)**2)
+        v_net_loss = torch.mean((returns_th.detach() - values_th)**2)
         self.value_net_optimizer.zero_grad()
         v_net_loss.backward()
         self.value_net_optimizer.step()
+
+        writer.add_scalar('train/v_loss', v_net_loss, self.train_steps)
+        writer.add_scalar('train/pi_loss', loss, self.train_steps)
+
 
     def get_kl(self, x):
         mean, log_std = self.policy_net(x)
@@ -101,7 +106,6 @@ class TRPOAgent:
         std_detached = std.detach()
         kl = log_std - log_std_detached + (std_detached.pow(2) + (mean_detached - mean).pow(2)) / (2.0 * std.pow(2)) - 0.5
 
-        pdb.set_trace()
         return kl.sum()
 
     def Fvp_direct(self, states, v):
@@ -114,7 +118,7 @@ class TRPOAgent:
         grads_v = torch.sum(grads_flat * v)
         # now compute the derivative again.
         grads_grads_v = torch.autograd.grad(grads_v, self.policy_net.parameters(), create_graph=False)
-        flat_grad_grad_v = torch.cat([grad.contiguous().view(-1) for grad in grads_grads_v]).data
+        flat_grad_grad_v = torch.cat([grad.contiguous().view(-1) for grad in grads_grads_v]).detach()
         return flat_grad_grad_v + v * damping
 
     def conjugate_gradient(self, states, b, n_steps, residue_limit=1e-4):
@@ -128,8 +132,8 @@ class TRPOAgent:
             x += alpha * p
             r -= alpha * Avp
             new_rdotr = torch.dot(r, r)
-            betta = new_rdotr / rdotr
-            p = r + betta * p
+            beta = new_rdotr / rdotr
+            p = r + beta * p
             rdotr = new_rdotr
             if rdotr < residue_limit:
                 break
