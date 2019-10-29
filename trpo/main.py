@@ -1,10 +1,13 @@
 import torch
+import numpy as np
 import gym
 from rl_implementations.trpo.trpo_agent import TRPOAgent
+from rl_implementations.trpo.utils import evaluate
 import pdb
 
 n_train_steps_per_epoch = 1000
 n_epochs = 100
+n_eval_every = 1
 env_name = 'Pendulum-v0'
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 gamma = 0.99
@@ -18,8 +21,8 @@ if __name__=='__main__':
         steps = 0
         dones = []
         states = []
+        states2 = []
         actions = []
-        log_probs = []
         rewards = []
 
         n_episodes = 0
@@ -29,20 +32,26 @@ if __name__=='__main__':
             done = False
 
             states.append(state)
+            states2.append(state)
 
             while not done and steps < n_train_steps_per_epoch:
-                action, log_prob = agent.get_action(state)
-                new_obs, rew, done, info = env.step(action)
+                action = agent.get_action(state)
+                new_obs, rew, done, info = env.step(np.tanh(action))
                 steps += 1
 
                 states.append(new_obs)
+                if not done:
+                    states2.append(new_obs)
                 actions.append(action)
-                log_probs.append(log_prob)
                 rewards.append(rew)
                 dones.append(done)
 
-        trajectories = (states, actions, log_probs, rewards, dones)
+        trajectories = (states, states2, actions, rewards, dones)
         agent.optimize_model(trajectories)
+
+        if ep % n_eval_every == 0:
+            eval_rew = evaluate(agent, env)
+            print("Epoch: {}, Eval Reward: {}".format(ep, eval_rew))
 
 
 

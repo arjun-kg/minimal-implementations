@@ -1,15 +1,16 @@
 from rl_implementations.utils.networks import MLP
-from rl_implementations.trpo.utils import normal_log_density
+from rl_implementations.trpo.utils import normal_log_density, set_flat_params_to, get_flat_params_from
 import torch.optim as optim
-from torchviz import make_dot
+import math
 from torch.distributions import Normal
 import torch
 import pdb
 
 logstd_min = -20
 logstd_max = 2
-gamma = 0.99
+gamma = 1
 lr = 1e-3
+max_kl = 1e-2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class TRPOAgent:
@@ -29,18 +30,26 @@ class TRPOAgent:
         else:
             z = torch.normal(torch.zeros(action_mean_th.size()), torch.ones(action_mean_th.size())).to(device)
             action_th = action_mean_th + action_std_th*z
-            logprob_th = normal_log_density(action_th, action_mean_th, action_log_std_th, action_std_th)
-            return action_th.detach().cpu().numpy(), logprob_th
+            return action_th.detach().cpu().numpy()
+
+    def get_log_probs(self, states, actions):
+        action_means_th, action_log_stds_th = self.policy_net(states)
+        action_stds_th = action_log_stds_th.exp()
+        log_probs = normal_log_density(actions, action_means_th, action_log_stds_th, action_stds_th)
+        return log_probs
+
 
     def optimize_model(self, trajectories):
-        states, actions, log_probs, rewards, dones = trajectories
+        states, states2, actions, rewards, dones = trajectories
 
         states_th = torch.tensor(states).to(device).float()
-        actions_th = torch.tensor(actions).to(device)
-        log_probs_th = torch.cat(log_probs).to(device)
-        rewards_th = torch.tensor(rewards).to(device).unsqueeze(-1)
-        dones_th = torch.tensor(dones).to(device).unsqueeze(-1)
+        states2_th = torch.tensor(states2).to(device).float()
 
+        actions_th = torch.tensor(actions).to(device)
+        # rewards_th = torch.tensor(rewards).to(device).unsqueeze(-1)
+        # dones_th = torch.tensor(dones).to(device).unsqueeze(-1)
+
+        log_probs_th = self.get_log_probs(states2_th, actions_th)
         values_th = self.value_net(states_th)
 
         # rewards to go:
@@ -55,22 +64,30 @@ class TRPOAgent:
             adv = rewards[i] + gamma*v_next - values_th[st_p-1]
             advantages.append(adv)
 
-            if dones[i]:
+            if dones[i] and i != len(rewards) - 1:
                 st_p -= 2
             else:
                 st_p -= 1
         returns.reverse()
         advantages.reverse()
-
         advantages_th = torch.tensor(advantages).to(device)
         returns_th = torch.tensor(returns).to(device)
 
-        loss = -torch.mean(log_probs_th*advantages_th)
-        g = torch.autograd.grad(loss, self.policy_net.parameters(), retain_graph=True, allow_unused=True)
-        g = torch.cat([grad.view(-1) for grad in g]).detach()
-        x = self.conjugate_gradient(states_th, g, 100)
+        loss = -torch.mean(torch.exp(log_probs_th - log_probs_th.detach())*advantages_th)
+        g = torch.autograd.grad(loss, self.policy_net.parameters(), retain_graph=True)
+        loss_grad = torch.cat([grad.view(-1) for grad in g]).detach()
+        stepdir = self.conjugate_gradient(states2_th, -loss_grad, 10)
 
-        pdb.set_trace()
+        shs = 0.5 * (stepdir.dot(self.Fvp_direct(states2_th, stepdir)))
+        lm = math.sqrt(max_kl / shs)
+        # pdb.set_trace()
+        fullstep = stepdir * lm
+        expected_improve = -loss_grad.dot(fullstep)
+
+        prev_params = get_flat_params_from(self.policy_net)
+        success, new_params = self.line_search(advantages_th, states2_th, actions_th, prev_params, fullstep, expected_improve)
+        set_flat_params_to(self.policy_net, new_params)
+
         v_net_loss = torch.mean((returns_th - values_th)**2)
         self.value_net_optimizer.zero_grad()
         v_net_loss.backward()
@@ -83,6 +100,8 @@ class TRPOAgent:
         log_std_detached = log_std.detach()
         std_detached = std.detach()
         kl = log_std - log_std_detached + (std_detached.pow(2) + (mean_detached - mean).pow(2)) / (2.0 * std.pow(2)) - 0.5
+
+        pdb.set_trace()
         return kl.sum()
 
     def Fvp_direct(self, states, v):
@@ -115,3 +134,21 @@ class TRPOAgent:
             if rdotr < residue_limit:
                 break
         return x
+
+    def line_search(self, advantages_th, states_th, actions_th, x, fullstep, expected_improve_full, max_backtracks=10, accept_ratio=0.1):
+        log_probs_th = self.get_log_probs(states_th, actions_th)
+        loss_val = -torch.mean(torch.exp(log_probs_th - log_probs_th.detach())*advantages_th)
+
+        for stepfrac in [.5 ** i for i in range(max_backtracks)]:
+            x_new = x + stepfrac * fullstep
+            set_flat_params_to(self.policy_net, x_new)
+
+            new_log_probs_th = self.get_log_probs(states_th, actions_th)
+            new_loss_val = -torch.mean(torch.exp(new_log_probs_th - new_log_probs_th.detach())*advantages_th)
+            actual_improve = loss_val - new_loss_val
+            expected_improve = expected_improve_full * stepfrac
+            ratio = actual_improve / expected_improve
+
+            if ratio > accept_ratio:
+                return True, x_new
+        return False, x
