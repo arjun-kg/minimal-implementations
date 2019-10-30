@@ -15,8 +15,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class TRPOAgent:
     def __init__(self, n_obs, n_act):
-        self.policy_net = MLP((n_obs,), (n_act, n_act), 2, 64, (lambda x: x, lambda x: torch.clamp(x, min=logstd_min, max=logstd_max))).to(device)
-        self.value_net = MLP((n_obs,), (1,), 2, 64, (lambda x: x,)).to(device)
+        self.policy_net = MLP((n_obs,), (n_act, n_act), 3, 256, (lambda x: x, lambda x: torch.clamp(x, min=logstd_min, max=logstd_max))).to(device)
+        self.value_net = MLP((n_obs,), (1,), 3, 256, (lambda x: x,)).to(device)
 
         self.value_net_optimizer = optim.Adam(self.value_net.parameters(), lr)
         self.train_steps = 0
@@ -72,19 +72,19 @@ class TRPOAgent:
         returns.reverse()
         advantages.reverse()
         advantages_th = torch.cat(advantages).to(device)
-        # advantages_th = (advantages_th - advantages_th.mean())/(advantages_th.std() + 1e-4)
+        advantages_th = advantages_th/advantages_th.norm()
         returns_th = torch.tensor(returns).to(device)
 
         loss = -torch.mean(torch.exp(log_probs_th - log_probs_th.detach())*advantages_th)
         g = torch.autograd.grad(loss, self.policy_net.parameters(), retain_graph=True)
         loss_grad = torch.cat([grad.view(-1) for grad in g]).detach()
+        loss_grad = loss_grad/loss_grad.norm()
         s = self.conjugate_gradient(states2_th, -loss_grad, 10)
 
         shs = 0.5 * (s.dot(self.Fvp_direct(states2_th, s)))
         lm = math.sqrt(max_kl / shs)
         fullstep = s * lm
         expected_improve = -loss_grad.dot(fullstep)
-
         prev_params = get_flat_params_from(self.policy_net)
         success, new_params = self.line_search(advantages_th, states2_th, actions_th, prev_params, fullstep, expected_improve)
         set_flat_params_to(self.policy_net, new_params)
@@ -142,17 +142,18 @@ class TRPOAgent:
     def line_search(self, advantages_th, states_th, actions_th, x, fullstep, expected_improve_full, max_backtracks=10, accept_ratio=0.1):
         log_probs_th = self.get_log_probs(states_th, actions_th)
         loss_val = -torch.mean(torch.exp(log_probs_th - log_probs_th.detach())*advantages_th)
-
+        # pdb.set_trace()
         for stepfrac in [.5 ** i for i in range(max_backtracks)]:
             x_new = x + stepfrac * fullstep
             set_flat_params_to(self.policy_net, x_new)
 
             new_log_probs_th = self.get_log_probs(states_th, actions_th)
-            new_loss_val = -torch.mean(torch.exp(new_log_probs_th - new_log_probs_th.detach())*advantages_th)
+            new_loss_val = -torch.mean(torch.exp(new_log_probs_th - log_probs_th.detach())*advantages_th)
             actual_improve = loss_val - new_loss_val
             expected_improve = expected_improve_full * stepfrac
             ratio = actual_improve / expected_improve
 
             if ratio > accept_ratio:
+                print("YASS")
                 return True, x_new
         return False, x
